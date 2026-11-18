@@ -1,0 +1,9 @@
+# screen recordings and other large media
+*.mp4
+*.mov
+*.m4v
+
+# macOS / editor clutter
+.DS_Store
+.claude/
+__pycache__/
