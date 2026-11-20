@@ -118,6 +118,17 @@ const LANCE_HP = 3;   // each jouster lance survives this many hits
 const USES = { bounce: 3, homing: 3 };          // multi-shot powers; everything else is one use
 let HOMING_TURN = 1.8, HOMING_RANGE = 340;      // gentle homing so it's not OP
 let MAGNET_RANGE = 110, MAGNET_PULL = 320;      // pickups drift toward nearby ships
+let LASER_W = 12, LASER_LIVE = 0.15;             // laser hitbox half-width beyond the target, and how long the beam stays deadly
+let SPAWN_SHIELD = 1.0, MINE_FUSE = 1.0;
+// hazards: black hole pull/reach/deadly core, turret spin speed and fire rate
+let HOLE_G = 900, HOLE_RANGE = 300, HOLE_CORE = 20, TURRET_SPIN = 1.1, TURRET_RATE = 0.4, TURRET_R = 26;
+const HAZARD_NAME = { blackhole: 'BLACK HOLE', zap: 'LASER GRID', turret: 'TURRET' };
+const HAZARD_COLOR = '#ff3b5c';         // protection after GO; mine countdown once a ship enters its kill zone
+TUNABLES.push(
+  ['Laser hit width', 0, 30, 1, () => LASER_W, v => LASER_W = v],
+  ['Spawn protection (s)', 0, 3, 0.1, () => SPAWN_SHIELD, v => SPAWN_SHIELD = v],
+  ['Mine fuse (s)', 0, 2, 0.1, () => MINE_FUSE, v => MINE_FUSE = v],
+);
 TUNABLES.push(
   ['Homing shot turn rate', 0, 6, 0.1, () => HOMING_TURN, v => HOMING_TURN = v],
   ['Pickup magnet range', 0, 250, 5, () => MAGNET_RANGE, v => MAGNET_RANGE = v],
@@ -289,6 +300,90 @@ const MAPS = [
     '#.....+.........',
     '#..o..+.........',
   ]},
+  // wrap-around maps: gaps in the outer wall lead to the opposite side
+  { name: 'ORBIT', wrap: true, q: [
+    '######..........',
+    '#...............',
+    '#...............',
+    '#....##.........',
+    '.....#......+...',
+    '............+...',
+    '..........o.....',
+    '.........###....',
+    '................',
+  ]},
+  { name: 'TUNNELS', wrap: true, q: [
+    '################',
+    '#...............',
+    '#.....++........',
+    '#.....#.....o...',
+    '......#.........',
+    '..........###...',
+    '................',
+    '....+.......#...',
+    '............#...',
+  ]},
+  { name: 'FREEFALL', wrap: true, q: [
+    '................',
+    '................',
+    '...##...........',
+    '...#......+.....',
+    '..........+..o..',
+    '.......##.......',
+    '.......#........',
+    '................',
+    '..o.............',
+  ]},
+  // hazard maps
+  { name: 'SINGULARITY', holes: [[W * 0.27, H / 2], [W * 0.73, H / 2]], q: [
+    '################',
+    '#...............',
+    '#...............',
+    '#..##.......o...',
+    '#...........+...',
+    '#...........+...',
+    '#...............',
+    '#...............',
+    '#...............',
+  ]},
+  { name: 'LASER GRID', zaps: [
+      { x1: 0, y1: H * 0.3, x2: W, y2: H * 0.3, period: 8, start: 0, warn: 1.2, on: 0.9 },
+      { x1: 0, y1: H * 0.7, x2: W, y2: H * 0.7, period: 8, start: 0, warn: 1.2, on: 0.9 },
+      { x1: W * 0.3, y1: 0, x2: W * 0.3, y2: H, period: 8, start: 4, warn: 1.2, on: 0.9 },
+      { x1: W * 0.7, y1: 0, x2: W * 0.7, y2: H, period: 8, start: 4, warn: 1.2, on: 0.9 },
+    ], q: [
+    '################',
+    '#...............',
+    '#...............',
+    '#....###........',
+    '#...............',
+    '#.........++....',
+    '#..o......+.....',
+    '#...............',
+    '#...............',
+  ]},
+  { name: 'TURRET', turret: [W / 2, H / 2], q: [
+    '################',
+    '#...............',
+    '#...............',
+    '#...##......##..',
+    '#...#...........',
+    '#...............',
+    '#..........#....',
+    '#...........+...',
+    '#.o.............',
+  ]},
+  { name: 'CANOPY', covers: [[3, 3, 5, 4], [24, 3, 5, 4], [3, 11, 5, 4], [24, 11, 5, 4], [13, 7, 6, 4]], q: [
+    '################',
+    '#...............',
+    '#...............',
+    '#...............',
+    '#........#......',
+    '#...............',
+    '#...........+...',
+    '#...............',
+    '#..o............',
+  ]},
   { name: 'MAZE', q: [
     '################',
     '#...............',
@@ -325,7 +420,8 @@ function generateMap() {
 let state = 'lobby', time = 0;
 let joined = PIDS.map(() => false), scores = PIDS.map(() => 0), target = 5;
 let ships = [], pilots = [], bullets = [], rocks = [], powerups = [], mines = [], beams = [], parts = [], floaters = [];
-let gridB = [];
+let hz = { holes: [], zaps: [], turret: null, covers: [], t: 0 }; // this map's hazards
+let gridB = [], curWrap = false; // curWrap: this map's open edges lead to the opposite side
 const ROUND_END_TIME = 2.5;
 let countdown = 0, endTimer = -1, roundEndT = 0, roundWinner = -1, powerTimer = 0, shake = 0;
 let mapIdx = -1, roundNum = 0, matchWinner = -1, lastScored = -1;
@@ -382,6 +478,14 @@ function makeRock(x, y, r) {
 }
 
 function buildMap(def) {
+  curWrap = !!def.wrap;
+  hz = {
+    holes: (def.holes || []).map(([x, y]) => ({ x, y, spin: rand(0, TAU) })),
+    zaps: (def.zaps || []).map(z => ({ ...z, state: 'off' })),
+    turret: def.turret ? { x: def.turret[0], y: def.turret[1], a: rand(0, TAU), cd: 2.5, side: 1 } : null,
+    covers: (def.covers || []).map(([c, r, w, h]) => ({ x: c * CELL, y: r * CELL, w: w * CELL, h: h * CELL })),
+    t: 0,
+  };
   gridB = []; rocks = [];
   for (let r = 0; r < ROWS; r++) {
     const qr = r < 9 ? r : 17 - r;
@@ -390,7 +494,7 @@ function buildMap(def) {
     const g = [];
     for (let c = 0; c < COLS; c++) {
       let ch = row[c];
-      if (r === 0 || r === ROWS - 1 || c === 0 || c === COLS - 1) ch = '#';
+      if (!def.wrap && (r === 0 || r === ROWS - 1 || c === 0 || c === COLS - 1)) ch = '#';
       const x = c * CELL, y = r * CELL;
       if (ch === '#') g.push({ c, r, x, y, solid: true, hp: Infinity, flash: 0 });
       else if (ch === '+') g.push({ c, r, x, y, solid: false, hp: 3, flash: 0 });
@@ -401,15 +505,23 @@ function buildMap(def) {
     }
     gridB.push(g);
   }
-  // keep spawn areas clear
-  const used = SPAWNS.filter((_, i) => joined[i]);
-  for (const [sx, sy] of used) for (let r = 1; r < ROWS - 1; r++) for (let c = 1; c < COLS - 1; c++) {
-    const cx = c * CELL + CELL / 2, cy = r * CELL + CELL / 2;
-    if (Math.hypot(cx - sx, cy - sy) < 90) gridB[r][c] = null;
-  }
-  rocks = rocks.filter(rk => used.every(([sx, sy]) => Math.hypot(rk.x - sx, rk.y - sy) > 110));
 }
-const cellAt = (c, r) => (r >= 0 && r < ROWS && c >= 0 && c < COLS) ? gridB[r][c] : null;
+const cellAt = (c, r) => {
+  if (curWrap) { c = ((c % COLS) + COLS) % COLS; r = ((r % ROWS) + ROWS) % ROWS; }
+  return (r >= 0 && r < ROWS && c >= 0 && c < COLS) ? gridB[r][c] : null;
+};
+function wrapPos(e) { if (curWrap) { e.x = ((e.x % W) + W) % W; e.y = ((e.y % H) + H) % H; } }
+// extra copies of something near an open edge, so it shows on both sides while crossing
+function wrapCopies(e, m) {
+  if (!curWrap) return [e];
+  const xs = [0], ys = [0];
+  if (e.x < m) xs.push(W); else if (e.x > W - m) xs.push(-W);
+  if (e.y < m) ys.push(H); else if (e.y > H - m) ys.push(-H);
+  if (xs.length === 1 && ys.length === 1) return [e];
+  const out = [];
+  for (const dx of xs) for (const dy of ys) out.push(dx || dy ? { ...e, x: e.x + dx, y: e.y + dy } : e);
+  return out;
+}
 const blockAtPt = (x, y) => cellAt(Math.floor(x / CELL), Math.floor(y / CELL));
 
 // circle vs grid blocks; pushes entity out & bounces velocity
@@ -419,13 +531,14 @@ function collideBlocks(e, bounce) {
   const r0 = Math.floor((e.y - e.r) / CELL), r1 = Math.floor((e.y + e.r) / CELL);
   for (let r = r0; r <= r1; r++) for (let c = c0; c <= c1; c++) {
     const b = cellAt(c, r); if (!b) continue;
-    const cx = clamp(e.x, b.x, b.x + CELL), cy = clamp(e.y, b.y, b.y + CELL);
+    const bx = c * CELL, by = r * CELL;
+    const cx = clamp(e.x, bx, bx + CELL), cy = clamp(e.y, by, by + CELL);
     const dx = e.x - cx, dy = e.y - cy, dd = dx * dx + dy * dy;
     if (dd >= e.r * e.r) continue;
     let nx, ny, pen;
     if (dd > 1e-6) { const d = Math.sqrt(dd); nx = dx / d; ny = dy / d; pen = e.r - d; }
     else {
-      const l = e.x - b.x, rr = b.x + CELL - e.x, t = e.y - b.y, bt = b.y + CELL - e.y, m = Math.min(l, rr, t, bt);
+      const l = e.x - bx, rr = bx + CELL - e.x, t = e.y - by, bt = by + CELL - e.y, m = Math.min(l, rr, t, bt);
       if (m === l) { nx = -1; ny = 0; } else if (m === rr) { nx = 1; ny = 0; } else if (m === t) { nx = 0; ny = -1; } else { nx = 0; ny = 1; }
       pen = m + e.r;
     }
@@ -437,7 +550,7 @@ function collideBlocks(e, bounce) {
     }
     hit = true;
   }
-  e.x = clamp(e.x, e.r, W - e.r); e.y = clamp(e.y, e.r, H - e.r);
+  if (curWrap) wrapPos(e); else { e.x = clamp(e.x, e.r, W - e.r); e.y = clamp(e.y, e.r, H - e.r); }
   return hit;
 }
 
@@ -498,14 +611,35 @@ function startRound() {
   feed = [];
   for (const b of brain) { b.aim = 0; b.fcd = 0.6; b.err = 0; b.errT = 0; b.wandering = false; b.wanderT = rand(1, 3); b.gx = b.gy = null; b.holdT = 0; }
   for (const o of inp) o.turn = o.fire = o.turnP = o.fireP = false;
-  joined.forEach((j, p) => {
-    if (!j) return;
-    const [x, y] = SPAWNS[p];
-    spawnShip(p, x, y, Math.atan2(H / 2 - y, W / 2 - x), 0);
+  const ids = PIDS.filter(p => joined[p]), spots = pickSpawns(ids.length);
+  ids.forEach((p, i) => { // random, spread-out spots; protected through the countdown and a moment after GO
+    const { x, y } = spots[i];
+    spawnShip(p, x, y, Math.atan2(H / 2 - y, W / 2 - x) + rand(-0.4, 0.4), 1.8 + SPAWN_SHIELD);
   });
   countdown = 1.8; endTimer = -1; powerTimer = 4; roundWinner = -1; lastScored = -1;
   slowT = 0; hitstop = 0; lastKill = null; focus = null;
   state = 'play';
+}
+// random open spots, each chosen to be as far as possible from the ones already picked
+function pickSpawns(n) {
+  const cands = [];
+  for (let r = 1; r < ROWS - 1; r++) for (let c = 1; c < COLS - 1; c++) {
+    const x = c * CELL + CELL / 2, y = r * CELL + CELL / 2;
+    const safe = hz.holes.every(h => Math.hypot(h.x - x, h.y - y) > HOLE_RANGE * 0.8) && (!hz.turret || Math.hypot(hz.turret.x - x, hz.turret.y - y) > 170)
+      && hz.zaps.every(z => segDist(x, y, z.x1, z.y1, z.x2, z.y2) > 50);
+    if (safe && circleFree(x, y, 50) && rocks.every(rk => Math.hypot(rk.x - x, rk.y - y) > rk.r + 80)) cands.push({ x, y });
+  }
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    let best = null, bestD = -1;
+    for (let k = 0; k < 40 && cands.length; k++) {
+      const cnd = cands[Math.floor(Math.random() * cands.length)];
+      const dmin = out.length ? Math.min(...out.map(o => Math.hypot(o.x - cnd.x, o.y - cnd.y))) : Math.random();
+      if (dmin > bestD) { bestD = dmin; best = cnd; }
+    }
+    out.push(best || { x: SPAWNS[i % SPAWNS.length][0], y: SPAWNS[i % SPAWNS.length][1] });
+  }
+  return out;
 }
 function spawnShip(p, x, y, a, inv) {
   ships.push({ p, x, y, vx: 0, vy: 0, a, r: SHIP_R, ammo: MAXAMMO, reload: 0, shield: false, power: null,
@@ -567,22 +701,135 @@ function fire(s) {
   }
 }
 function fireLaser(s) {
-  const dx = Math.cos(s.a), dy = Math.sin(s.a);
-  let x = s.x + dx * SHIP_R, y = s.y + dy * SHIP_R;
-  for (let len = 0; len < 2000; len += 4) {
+  const dx = Math.cos(s.a), dy = Math.sin(s.a), segs = [];
+  let sx = s.x, sy = s.y, x = s.x, y = s.y;
+  const maxLen = curWrap ? Math.max(W, H) * 1.2 : 2000;
+  for (let len = 0; len < maxLen; len += 4) {
     x += dx * 4; y += dy * 4;
+    if (x < 0 || y < 0 || x > W || y > H) {
+      if (!curWrap) break;
+      segs.push([sx, sy, x, y]); // beam leaves one edge and comes back in the other
+      x = ((x % W) + W) % W; y = ((y % H) + H) % H; sx = x - dx * 4; sy = y - dy * 4;
+    }
     const b = blockAtPt(x, y);
-    if (x < 0 || y < 0 || x > W || y > H) break;
     if (b && !b.solid) damageBlock(b, 99); // passes through walls; smashes every crate on its line
   }
-  const x1 = s.x, y1 = s.y;
-  beams.push({ x1, y1, x2: x, y2: y, t: 0.35, max: 0.35, color: PDEF[s.p].color });
-  for (const o of ships) if (!o.dead && foes(o.p, s.p) && o.inv <= 0 && segDist(o.x, o.y, x1, y1, x, y) < o.r + 6) hitShip(o, s.p, 'laser');
-  for (const q of pilots) if (!q.dead && foes(q.p, s.p) && segDist(q.x, q.y, x1, y1, x, y) < PILOT_R + 6) killPilot(q, s.p, 'laser');
-  for (const rk of rocks) if (!rk.dead && segDist(rk.x, rk.y, x1, y1, x, y) < rk.r) damageRock(rk, 99);
-  for (const m of mines) if (segDist(m.x, m.y, x1, y1, x, y) < 12) m.boom = true;
+  segs.push([sx, sy, x, y]);
+  const bm = { segs, t: 0.35, max: 0.35, live: LASER_LIVE, owner: s.p, color: PDEF[s.p].color };
+  beams.push(bm); laserHits(bm);
   burst(x, y, PDEF[s.p].color, 16, 260, 0.5);
   shake += 10; SFX.laser(); s.vx -= dx * 220; s.vy -= dy * 220;
+}
+// the beam's hitbox matches its glow, and it stays deadly for LASER_LIVE seconds
+// ---------------- map hazards ----------------
+const underCover = e => hz.covers.some(c => e.x > c.x && e.x < c.x + c.w && e.y > c.y && e.y < c.y + c.h);
+function updateHazards(dt) {
+  hz.t += dt;
+  // black holes: pull everything in; the core destroys ships outright and swallows bullets and asteroids
+  for (const h of hz.holes) {
+    h.spin += dt * 2.5;
+    const pull = (e, k) => {
+      const dx = h.x - e.x, dy = h.y - e.y, d = Math.hypot(dx, dy);
+      if (d < HOLE_RANGE && d > 1) { const f = HOLE_G * k * (1 - d / HOLE_RANGE) ** 2; e.vx += dx / d * f * dt; e.vy += dy / d * f * dt; }
+      return d;
+    };
+    for (const s of ships) if (!s.dead && pull(s, 1) < HOLE_CORE + s.r * 0.5) { s.shield = false; s.inv = 0; hitShip(s, -1, 'blackhole'); }
+    for (const q of pilots) if (!q.dead && pull(q, 1) < HOLE_CORE + PILOT_R) { q.inv = 0; killPilot(q, -1, 'blackhole'); }
+    for (const b of bullets) if (!b.dead && pull(b, 1.6) < HOLE_CORE) b.dead = true;
+    for (const rk of rocks) if (!rk.dead && pull(rk, 0.6) < HOLE_CORE + rk.r * 0.4) { rk.dead = true; burst(rk.x, rk.y, '#8d83d6', 10, 120, 0.5, 2); }
+  }
+  // laser grid: each beam warns, fires, then rests, on a fixed cycle
+  for (const z of hz.zaps) {
+    const ph = (((hz.t - z.start) % z.period) + z.period) % z.period, was = z.state;
+    z.state = ph < z.warn ? 'warn' : ph < z.warn + z.on ? 'on' : 'off';
+    if (z.state === 'warn' && was !== 'warn') tone(300, 300, 0.25, 'sine', 0.05);
+    if (z.state === 'on' && was !== 'on') { SFX.laser(); shake += 5; }
+    if (z.state !== 'on') continue;
+    for (const s of ships) if (!s.dead && s.inv <= 0 && segDist(s.x, s.y, z.x1, z.y1, z.x2, z.y2) < s.r + 8) hitShip(s, -1, 'zap');
+    for (const q of pilots) if (!q.dead && segDist(q.x, q.y, z.x1, z.y1, z.x2, z.y2) < PILOT_R + 8) { q.inv = 0; killPilot(q, -1, 'zap'); }
+    for (const rk of rocks) if (!rk.dead && segDist(rk.x, rk.y, z.x1, z.y1, z.x2, z.y2) < rk.r) damageRock(rk, 99);
+  }
+  // spinning turret: solid, indestructible, fires from alternating barrels
+  const tr = hz.turret;
+  if (tr) {
+    tr.a += TURRET_SPIN * dt; tr.cd -= dt;
+    if (tr.cd <= 0) {
+      tr.cd = TURRET_RATE; tr.side = -tr.side;
+      const c = Math.cos(tr.a), sn = Math.sin(tr.a), ox = -sn * 9 * tr.side, oy = c * 9 * tr.side;
+      bullets.push({ x: tr.x + c * 34 + ox, y: tr.y + sn * 34 + oy, vx: c * 430, vy: sn * 430, owner: -1, src: 'turret', life: 2.4, age: 1, r: 4, dead: false });
+      tone(500, 250, 0.05, 'square', 0.04);
+    }
+    const pushOut = (e, er, bounce) => {
+      const dx = e.x - tr.x, dy = e.y - tr.y, d = Math.hypot(dx, dy) || 1, R = TURRET_R + er;
+      if (d >= R) return;
+      const nx = dx / d, ny = dy / d; e.x = tr.x + nx * R; e.y = tr.y + ny * R;
+      const vn = e.vx * nx + e.vy * ny; if (vn < 0) { e.vx -= (1 + bounce) * vn * nx; e.vy -= (1 + bounce) * vn * ny; }
+    };
+    for (const s of ships) if (!s.dead) pushOut(s, s.r, 0.5);
+    for (const q of pilots) if (!q.dead) pushOut(q, PILOT_R, 0.3);
+    for (const rk of rocks) if (!rk.dead) pushOut(rk, rk.r, 1);
+    for (const b of bullets) if (!b.dead && b.owner !== -1 && Math.hypot(b.x - tr.x, b.y - tr.y) < TURRET_R) { b.dead = true; burst(b.x, b.y, '#9aa3ff', 5, 140, 0.25, 2); }
+  }
+}
+function drawHazardsUnder() { // black holes sit under everything
+  for (const h of hz.holes) {
+    const g = ctx.createRadialGradient(h.x, h.y, 0, h.x, h.y, HOLE_RANGE * 0.6);
+    g.addColorStop(0, 'rgba(0,0,0,1)'); g.addColorStop(0.12, 'rgba(10,0,25,0.95)'); g.addColorStop(0.4, 'rgba(90,40,170,0.18)'); g.addColorStop(1, 'rgba(90,40,170,0)');
+    ctx.fillStyle = g; ctx.beginPath(); ctx.arc(h.x, h.y, HOLE_RANGE * 0.6, 0, TAU); ctx.fill();
+    ctx.save(); ctx.translate(h.x, h.y); ctx.rotate(h.spin);
+    for (let i = 0; i < 3; i++) { // swirling accretion arcs
+      ctx.rotate(TAU / 3);
+      ctx.strokeStyle = `rgba(190,140,255,${0.35 - i * 0.06})`; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(0, 0, 34 + i * 16, 0, 1.6); ctx.stroke();
+    }
+    ctx.restore();
+    ctx.strokeStyle = 'rgba(220,190,255,0.8)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(h.x, h.y, HOLE_CORE + 6, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = 'rgba(160,110,255,0.12)'; ctx.setLineDash([4, 10]); ctx.beginPath(); ctx.arc(h.x, h.y, HOLE_RANGE, 0, TAU); ctx.stroke(); ctx.setLineDash([]);
+  }
+}
+function drawHazardsOver() { // laser grid beams and the turret
+  for (const z of hz.zaps) {
+    if (z.state === 'off') continue;
+    ctx.lineCap = 'butt';
+    if (z.state === 'warn') { // thin flashing warning line
+      ctx.strokeStyle = Math.sin(hz.t * 30) > 0 ? 'rgba(255,60,90,0.8)' : 'rgba(255,60,90,0.25)'; ctx.lineWidth = 2; ctx.setLineDash([12, 8]);
+      ctx.beginPath(); ctx.moveTo(z.x1, z.y1); ctx.lineTo(z.x2, z.y2); ctx.stroke(); ctx.setLineDash([]);
+    } else {
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.strokeStyle = 'rgba(255,40,80,0.45)'; ctx.lineWidth = 26 + Math.sin(hz.t * 60) * 4;
+      ctx.beginPath(); ctx.moveTo(z.x1, z.y1); ctx.lineTo(z.x2, z.y2); ctx.stroke();
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 6; ctx.stroke();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+  }
+  const tr = hz.turret;
+  if (tr) {
+    ctx.save(); ctx.translate(tr.x, tr.y);
+    ctx.fillStyle = '#1a1c38'; ctx.strokeStyle = '#6a73e6'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.arc(0, 0, TURRET_R, 0, TAU); ctx.fill(); ctx.stroke();
+    ctx.rotate(tr.a);
+    ctx.fillStyle = '#2b2e5a'; ctx.strokeStyle = HAZARD_COLOR; ctx.lineWidth = 2;
+    for (const sd of [-1, 1]) { ctx.beginPath(); ctx.roundRect(10, sd * 9 - 4, 26, 8, 3); ctx.fill(); ctx.stroke(); }
+    ctx.fillStyle = HAZARD_COLOR; ctx.beginPath(); ctx.arc(0, 0, 9, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+}
+function drawCovers() { // rooftops drawn over ships: anything underneath is hidden
+  for (const c of hz.covers) {
+    ctx.fillStyle = 'rgba(22,24,48,0.97)'; ctx.fillRect(c.x, c.y, c.w, c.h);
+    ctx.save(); ctx.beginPath(); ctx.rect(c.x, c.y, c.w, c.h); ctx.clip();
+    ctx.strokeStyle = 'rgba(120,130,255,0.09)'; ctx.lineWidth = 6;
+    for (let k = -c.h; k < c.w; k += 18) { ctx.beginPath(); ctx.moveTo(c.x + k, c.y + c.h); ctx.lineTo(c.x + k + c.h, c.y); ctx.stroke(); }
+    ctx.restore();
+    ctx.strokeStyle = '#4a52a8'; ctx.lineWidth = 2; ctx.strokeRect(c.x + 1, c.y + 1, c.w - 2, c.h - 2);
+  }
+}
+function laserHits(bm) {
+  const near = (e, rad) => bm.segs.some(([a, b, c, d]) => segDist(e.x, e.y, a, b, c, d) < rad);
+  for (const o of ships) if (!o.dead && foes(o.p, bm.owner) && o.inv <= 0 && near(o, o.r + LASER_W)) hitShip(o, bm.owner, 'laser');
+  for (const q of pilots) if (!q.dead && foes(q.p, bm.owner) && near(q, PILOT_R + LASER_W)) killPilot(q, bm.owner, 'laser');
+  for (const rk of rocks) if (!rk.dead && near(rk, rk.r)) damageRock(rk, 99);
+  for (const m of mines) if (!m.boom && near(m, 14)) m.boom = true;
 }
 function hitShip(s, by, wpn = 'gun') {
   if (s.dead) return;
@@ -840,7 +1087,7 @@ function botThink(p, dt) {
     const fx = Math.cos(s.a), fy = Math.sin(s.a), look = (60 + Math.hypot(s.vx, s.vy) * 0.25) * lv.look;
     const blocked = !rayClear(s.x, s.y, s.x + fx * look, s.y + fy * look);
     let tgt = null, td = Infinity;
-    for (const t of [...ships, ...pilots]) { if (t.dead || !foes(p, t.p)) continue; const d = Math.hypot(t.x - s.x, t.y - s.y); if (d < td) { td = d; tgt = t; } }
+    for (const t of [...ships, ...pilots]) { if (t.dead || !foes(p, t.p)) continue; const d = Math.hypot(t.x - s.x, t.y - s.y); if (underCover(t) && d > 160) continue; if (d < td) { td = d; tgt = t; } }
     let goal = null, shootGoal = false;
     if (tgt && !br.wandering) { const tt = td / BULLET_V * lv.lead; goal = { x: tgt.x + tgt.vx * tt, y: tgt.y + tgt.vy * tt }; shootGoal = true; }
     if (lv.pows && !s.power) { // go for power-ups when they're clearly closer than the enemy
@@ -849,6 +1096,8 @@ function botThink(p, dt) {
       for (const rk of rocks) if (rk.pow) { const d = Math.hypot(rk.x - s.x, rk.y - s.y); if (d < pd) { pd = d; pg = rk; } }
       if (pg && pd < td * 0.7) { goal = { x: pg.x, y: pg.y }; shootGoal = !pg.type; }
     }
+    const hole = hz.holes.find(h => Math.hypot(h.x - s.x, h.y - s.y) < 170);
+    if (hole) { goal = { x: s.x + (s.x - hole.x) * 3, y: s.y + (s.y - hole.y) * 3 }; shootGoal = false; } // get away from the black hole
     if (goal) { // perceived target point slides toward the real one: aim sweeps on instead of snapping
       if (br.gx == null) { br.gx = s.x + fx * 200; br.gy = s.y + fy * 200; }
       const k = 1 - Math.exp(-dt / Math.max(0.001, lv.lag));
@@ -1012,6 +1261,8 @@ function playUpdate(dt) {
   for (let i = 0; i < rocks.length; i++) for (let j = i + 1; j < rocks.length; j++)
     if (!rocks[i].dead && !rocks[j].dead) circlePush(rocks[i], rocks[j], rocks[i].r, rocks[j].r, 0.9, rocks[i].r, rocks[j].r);
 
+  if (!frozen) updateHazards(dt);
+
   // --- bullets ---
   for (const b of bullets) {
     if (b.dead) continue;
@@ -1026,7 +1277,7 @@ function playUpdate(dt) {
         b.vx = Math.cos(na) * sp; b.vy = Math.sin(na) * sp;
       }
     }
-    b.x += b.vx * dt; b.y += b.vy * dt; b.age += dt; b.life -= dt;
+    b.x += b.vx * dt; b.y += b.vy * dt; b.age += dt; b.life -= dt; wrapPos(b);
     if (b.life <= 0) { b.dead = true; continue; }
     const blk = blockAtPt(b.x, b.y);
     if (blk && blk.solid && b.kind === 'bounce' && b.bounces > 0) {
@@ -1065,9 +1316,18 @@ function playUpdate(dt) {
     if (m.done) continue;
     m.t += dt; m.arm -= dt;
     if (m.arm <= 0 && !m.boom) {
-      for (const s of ships) if (!s.dead && Math.hypot(s.x - m.x, s.y - m.y) < 44) m.boom = true;
-      for (const q of pilots) if (!q.dead && Math.hypot(q.x - m.x, q.y - m.y) < 38) m.boom = true;
-      if (m.arm < -0.0001 && Math.floor(m.t * 4) !== Math.floor((m.t - dt) * 4)) tone(1200, 1200, 0.03, 'square', 0.04);
+      // ships (not pilots) set it off: flying over it blows it now, entering the kill zone lights a short fuse
+      for (const s of ships) {
+        if (s.dead) continue;
+        const d = Math.hypot(s.x - m.x, s.y - m.y);
+        if (d < s.r + 10) m.boom = true;
+        else if (d < MINE_R * MINE_LETHAL && m.fuse == null) { m.fuse = MINE_FUSE; tone(900, 1800, 0.15, 'square', 0.12); }
+      }
+      if (m.fuse != null) {
+        m.fuse -= dt;
+        if (m.fuse <= 0) m.boom = true;
+        else if (Math.floor(m.fuse * 10) !== Math.floor((m.fuse + dt) * 10)) tone(1600, 1600, 0.03, 'square', 0.07); // fast ticking
+      } else if (m.arm < -0.0001 && Math.floor(m.t * 4) !== Math.floor((m.t - dt) * 4)) tone(1200, 1200, 0.03, 'square', 0.04);
     }
     if (m.boom) { m.done = true; explode(m.x, m.y, MINE_R, m.owner, 'mine'); }
   }
@@ -1112,7 +1372,7 @@ function playUpdate(dt) {
     }
   }
 
-  for (const bm of beams) bm.t -= dt;
+  for (const bm of beams) { bm.t -= dt; bm.live -= dt; if (bm.live > 0) laserHits(bm); }
 
   // --- cleanup ---
   ships = ships.filter(s => !s.dead);
@@ -1272,26 +1532,43 @@ function teamRing(x, y, r, p) {
   ctx.strokeStyle = TEAMS[cfg.team[p]].color; ctx.globalAlpha = 0.6; ctx.lineWidth = 2; ctx.setLineDash([5, 4]);
   ctx.beginPath(); ctx.arc(x, y, r, 0, TAU); ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
 }
+function drawPortals() { // open edges glow and scroll so you can see where you can fly through
+  ctx.strokeStyle = 'rgba(80,240,255,0.4)'; ctx.lineWidth = 3; ctx.setLineDash([6, 8]); ctx.lineDashOffset = -time * 30;
+  ctx.beginPath();
+  for (let c = 0; c < COLS; c++) {
+    if (!gridB[0][c]) { ctx.moveTo(c * CELL, 1.5); ctx.lineTo(c * CELL + CELL, 1.5); }
+    if (!gridB[ROWS - 1][c]) { ctx.moveTo(c * CELL, H - 1.5); ctx.lineTo(c * CELL + CELL, H - 1.5); }
+  }
+  for (let r = 0; r < ROWS; r++) {
+    if (!gridB[r][0]) { ctx.moveTo(1.5, r * CELL); ctx.lineTo(1.5, r * CELL + CELL); }
+    if (!gridB[r][COLS - 1]) { ctx.moveTo(W - 1.5, r * CELL); ctx.lineTo(W - 1.5, r * CELL + CELL); }
+  }
+  ctx.stroke(); ctx.setLineDash([]); ctx.lineDashOffset = 0;
+}
 function drawWorld() {
+  drawHazardsUnder();
   drawBlocks();
+  if (curWrap) drawPortals();
 
   // mines
   for (const m of mines) {
-    const armed = m.arm <= 0, blink = armed ? (Math.sin(m.t * 18) > 0) : (Math.sin(m.t * 40) > 0);
+    const armed = m.arm <= 0, fused = m.fuse != null, blink = fused ? Math.sin(m.t * 60) > 0 : armed ? (Math.sin(m.t * 18) > 0) : (Math.sin(m.t * 40) > 0);
     ctx.save(); ctx.translate(m.x, m.y); ctx.rotate(m.t * 1.5);
     ctx.strokeStyle = PDEF[m.owner].color; ctx.lineWidth = 2;
     for (let i = 0; i < 6; i++) { const a = i * TAU / 6; ctx.beginPath(); ctx.moveTo(Math.cos(a) * 6, Math.sin(a) * 6); ctx.lineTo(Math.cos(a) * 12, Math.sin(a) * 12); ctx.stroke(); }
     ctx.fillStyle = '#2a1012'; ctx.beginPath(); ctx.arc(0, 0, 8, 0, TAU); ctx.fill(); ctx.stroke();
-    ctx.fillStyle = blink ? '#ff5e57' : '#5a1a1a'; ctx.beginPath(); ctx.arc(0, 0, 3.5, 0, TAU); ctx.fill();
+    ctx.fillStyle = blink ? (fused ? '#ffffff' : '#ff5e57') : '#5a1a1a'; ctx.beginPath(); ctx.arc(0, 0, fused ? 5 : 3.5, 0, TAU); ctx.fill();
     ctx.restore();
-    if (armed) { // faint trigger ring + dashed kill zone
-      ctx.strokeStyle = 'rgba(255,94,87,0.12)'; ctx.lineWidth = 1; ctx.beginPath(); ctx.arc(m.x, m.y, 44, 0, TAU); ctx.stroke();
-      ctx.strokeStyle = 'rgba(255,94,87,0.22)'; ctx.setLineDash([3, 6]); ctx.beginPath(); ctx.arc(m.x, m.y, MINE_R * MINE_LETHAL, 0, TAU); ctx.stroke(); ctx.setLineDash([]);
+    if (fused) { // flashing kill zone while the fuse burns
+      ctx.fillStyle = `rgba(255,60,50,${blink ? 0.22 : 0.08})`; ctx.beginPath(); ctx.arc(m.x, m.y, MINE_R * MINE_LETHAL, 0, TAU); ctx.fill();
+      ctx.strokeStyle = blink ? '#ffffff' : '#ff5e57'; ctx.lineWidth = 2; ctx.stroke();
+    } else if (armed) { // dashed kill zone: a ship entering it lights the fuse
+      ctx.strokeStyle = 'rgba(255,94,87,0.25)'; ctx.lineWidth = 1; ctx.setLineDash([3, 6]); ctx.beginPath(); ctx.arc(m.x, m.y, MINE_R * MINE_LETHAL, 0, TAU); ctx.stroke(); ctx.setLineDash([]);
     }
   }
 
   // rocks
-  for (const rk of rocks) {
+  for (const rk0 of rocks) for (const rk of wrapCopies(rk0, 30)) {
     ctx.save(); ctx.translate(rk.x, rk.y); ctx.rotate(rk.rot);
     ctx.beginPath();
     rk.pts.forEach((r, i) => { const a = i / rk.pts.length * TAU; i ? ctx.lineTo(Math.cos(a) * r, Math.sin(a) * r) : ctx.moveTo(Math.cos(a) * r, Math.sin(a) * r); });
@@ -1333,10 +1610,9 @@ function drawWorld() {
   for (const bm of beams) {
     const k = bm.t / bm.max;
     ctx.lineCap = 'round';
-    ctx.strokeStyle = bm.color; ctx.globalAlpha = k * 0.6; ctx.lineWidth = 18 * k + 4;
-    ctx.beginPath(); ctx.moveTo(bm.x1, bm.y1); ctx.lineTo(bm.x2, bm.y2); ctx.stroke();
-    ctx.strokeStyle = '#ffffff'; ctx.globalAlpha = k; ctx.lineWidth = 5 * k + 1;
-    ctx.beginPath(); ctx.moveTo(bm.x1, bm.y1); ctx.lineTo(bm.x2, bm.y2); ctx.stroke();
+    const line = () => { ctx.beginPath(); for (const [a, b, c, d] of bm.segs) { ctx.moveTo(a, b); ctx.lineTo(c, d); } ctx.stroke(); };
+    ctx.strokeStyle = bm.color; ctx.globalAlpha = k * 0.6; ctx.lineWidth = 18 * k + 4; line();
+    ctx.strokeStyle = '#ffffff'; ctx.globalAlpha = k; ctx.lineWidth = 5 * k + 1; line();
   }
   ctx.globalAlpha = 1;
 
@@ -1358,8 +1634,8 @@ function drawWorld() {
   ctx.globalAlpha = 1;
 
   // bullets
-  for (const b of bullets) {
-    const c = b.kind ? POW[b.kind].color : PDEF[b.owner].color;
+  for (const b0 of bullets) for (const b of wrapCopies(b0, 10)) {
+    const c = b.owner < 0 ? HAZARD_COLOR : b.kind ? POW[b.kind].color : PDEF[b.owner].color;
     ctx.strokeStyle = c; ctx.globalAlpha = 0.5; ctx.lineWidth = 4; ctx.lineCap = 'round';
     ctx.beginPath(); ctx.moveTo(b.x - b.vx * 0.03, b.y - b.vy * 0.03); ctx.lineTo(b.x, b.y); ctx.stroke();
     ctx.fillStyle = c; ctx.globalAlpha = 0.45;
@@ -1370,7 +1646,7 @@ function drawWorld() {
   ctx.globalCompositeOperation = 'source-over';
 
   // pilots
-  for (const q of pilots) {
+  for (const q0 of pilots) for (const q of wrapCopies(q0, 20)) {
     const pd = PDEF[q.p];
     if (cfg.teams) teamRing(q.x, q.y, 20, q.p);
     const prog = 1 - q.timer / RESPAWN;
@@ -1391,7 +1667,7 @@ function drawWorld() {
 
   // ships
   const frozen = countdown > 0;
-  for (const s of ships) {
+  for (const s0 of ships) for (const s of wrapCopies(s0, 40)) {
     const pd = PDEF[s.p];
     if (s.inv > 0 && Math.sin(time * 40) < 0) continue;
     if (cfg.teams) teamRing(s.x, s.y, 25, s.p);
@@ -1436,6 +1712,9 @@ function drawWorld() {
     }
   }
 
+  drawHazardsOver();
+  drawCovers();
+
   // floaters
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   for (const f of floaters) {
@@ -1462,7 +1741,7 @@ function drawHUD() {
     x += groupW + gap;
   }
   ctx.font = `600 12px ${FONT}`; ctx.fillStyle = 'rgba(180,190,255,0.6)'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
-  ctx.fillText(`ROUND ${roundNum} · ${mapName}`, 16, 20);
+  ctx.fillText(`ROUND ${roundNum} · ${mapName}${curWrap ? '  ⇄ WRAP' : ''}`, 16, 20);
   ctx.textAlign = 'right'; ctx.fillText('ESC: PAUSE', W - 16, 20);
   if (countdown > 0) {
     const n = Math.ceil(countdown / 0.6), k = (countdown % 0.6) / 0.6;
@@ -1481,7 +1760,7 @@ function drawFeed() {
     ctx.globalAlpha = clamp(f.t, 0, 1);
     ctx.font = `700 12px ${FONT}`;
     const vic = PDEF[f.victim].name + (f.pilot ? ' PILOT' : '');
-    const kil = f.self ? 'SELF' : f.by >= 0 ? PDEF[f.by].name : '';
+    const kil = f.self ? 'SELF' : f.by >= 0 ? PDEF[f.by].name : HAZARD_NAME[f.wpn] || '';
     const vw = ctx.measureText(vic).width, kw = ctx.measureText(kil).width, total = vw + kw + 44;
     ctx.fillStyle = 'rgba(10,10,26,0.75)'; ctx.beginPath(); ctx.roundRect(W - 26 - total, y - 11, total + 20, 22, 6); ctx.fill();
     let x = W - 16;
@@ -1489,7 +1768,7 @@ function drawFeed() {
     if (POW[f.wpn]) drawIcon(f.wpn, x - 12, y, 6, POW[f.wpn].color);
     else { ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.font = `700 ${f.wpn === 'gun' ? 14 : 10}px ${FONT}`; ctx.fillText(WPN_TEXT[f.wpn] || '→', x - 12, y); }
     x -= 28; ctx.font = `700 12px ${FONT}`;
-    ctx.textAlign = 'right'; ctx.fillStyle = f.self ? '#9aa0c8' : f.by >= 0 ? PDEF[f.by].color : '#ffffff'; ctx.fillText(kil, x, y);
+    ctx.textAlign = 'right'; ctx.fillStyle = f.self ? '#9aa0c8' : f.by >= 0 ? PDEF[f.by].color : HAZARD_COLOR; ctx.fillText(kil, x, y);
     y += 26;
   }
   ctx.globalAlpha = 1;
