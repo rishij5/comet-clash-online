@@ -29,7 +29,9 @@ if [ -x "$TS" ]; then
   if [ -z "$HOST" ] && [ -d /Applications/Tailscale.app ]; then
     echo "Starting Tailscale…"
     open -g -a Tailscale
-    for _ in $(seq 1 20); do sleep 1; HOST="$(get_host)"; [ -n "$HOST" ] && break; done
+    sleep 2
+    "$TS" up --timeout 15s >/dev/null 2>&1 || true   # reconnect if it was switched off (uses your existing sign-in)
+    for _ in $(seq 1 20); do HOST="$(get_host)"; [ -n "$HOST" ] && break; sleep 1; done
   fi
 fi
 
