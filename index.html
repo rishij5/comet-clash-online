@@ -32,6 +32,7 @@
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"></script>
+<script src="ice-config.js"></script>
 <script>
 'use strict';
 // A phone that opens the main address gets the controller, not a second game screen.
@@ -2776,11 +2777,21 @@ const padStatus = PIDS.map(() => null);
 const P2P_PREFIX = 'comet-clash-v1-', CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
 const randomCode = () => Array.from({ length: 4 }, () => CODE_LETTERS[Math.floor(Math.random() * CODE_LETTERS.length)]).join('');
 // optional ?peerhost=host:port points PeerJS at your own broker (for testing or self-hosting)
+function iceConfig() {
+  const t = window.CC_TURN || {};
+  const iceServers = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloudflare.com:3478' }];
+  if (t.username && t.credential) iceServers.push({
+    urls: ['turn:relay1.expressturn.com:3478?transport=udp', 'turn:relay1.expressturn.com:3478?transport=tcp', 'turns:relay1.expressturn.com:443?transport=tcp'],
+    username: t.username, credential: t.credential,
+  });
+  return t.username ? { iceServers } : undefined; // undefined = PeerJS defaults
+}
 function peerOpts() {
   const h = new URLSearchParams(location.search).get('peerhost');
-  if (!h) return { debug: 0 };
+  const config = iceConfig();
+  if (!h) return config ? { debug: 0, config } : { debug: 0 };
   const [host, port] = h.split(':');
-  return { debug: 0, host, port: +port || 443, secure: location.protocol === 'https:' && host !== 'localhost', path: '/' };
+  return { debug: 0, ...(config ? { config } : {}), host, port: +port || 443, secure: location.protocol === 'https:' && host !== 'localhost', path: '/' };
 }
 function padURL() {
   if (net.mode === 'p2p') {
