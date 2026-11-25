@@ -2,4 +2,4 @@
 // Those networks block direct phone-to-screen connections, so traffic has to go through a relay.
 // Paste your ExpressTURN username and password (expressturn.com, free tier) between the quotes.
 // Leave them empty to use PeerJS's own public relays, which are often down.
-window.CC_TURN = { username: '', credential: '' };
+window.CC_TURN = { username: '000000002111077957', credential: 'jJ7KyKl8sShtfa53Ud1YDmm1IU4=' };
