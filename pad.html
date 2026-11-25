@@ -141,6 +141,7 @@
   <div id="msg"></div>
 </div>
 
+<script defer src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"></script>
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
@@ -155,9 +156,29 @@ const ICON_JET = '<path d="M24 6c6 8 10 13 10 20a10 10 0 0 1-20 0c0-4 2-7 4-9 0 
 
 let ws = null, retryT = null, kicked = false, lastMode = '';
 const held = { turn: false, fire: false };
+// 'ws' = server.py relay; 'p2p' = straight to the game screen over WebRTC (static hosting like GitHub Pages)
+let mode = params.get('p') === '1' || /\.github\.io$/.test(location.hostname) ? 'p2p' : 'ws';
+const P2P_PREFIX = 'comet-clash-v1-';
+let peer = null, conn = null, joinedRoom = '', seq = 0, tc = 0, fc = 0, lastSq = 0, hbT = null, echoT = null;
 
 function show(id) { for (const s of document.querySelectorAll('.screen')) s.classList.toggle('show', s.id === id); }
-function send(o) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); }
+function send(o) {
+  if (mode === 'p2p') { if (conn && conn.open) try { conn.send(o); } catch (e) {} }
+  else if (ws && ws.readyState === 1) ws.send(JSON.stringify(o));
+}
+// Button state goes out the instant it changes, with a sequence number and running press counts so the
+// game can use messages in any order and never miss a tap. A repeat follows 40 ms later and a heartbeat
+// keeps going (every 100 ms while a button is down), so a lost packet is covered fast.
+function sendInput() {
+  if (mode !== 'p2p') return send({ t: 'in', ...held });
+  send({ t: 'in', s: ++seq, tc, fc, ...held });
+  clearTimeout(echoT); echoT = setTimeout(() => send({ t: 'in', s: ++seq, tc, fc, ...held }), 40);
+}
+function heartbeat() {
+  clearTimeout(hbT);
+  if (mode === 'p2p' && conn && conn.open) send({ t: 'in', s: ++seq, tc, fc, ...held });
+  hbT = setTimeout(heartbeat, held.turn || held.fire ? 100 : 1000);
+}
 function setStatus(t) { $('status').textContent = t; }
 function setColor(hex) {
   const n = parseInt(hex.slice(1), 16);
@@ -185,16 +206,69 @@ function setPips(score, target) {
 
 function connect() {
   clearTimeout(retryT);
+  if (mode === 'p2p') return p2pConnect();
   if (ws) { ws.onclose = null; try { ws.close(); } catch (e) {} }
+  let opened = false;
   ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`);
-  ws.onopen = () => { $('net').classList.add('ok'); send({ t: 'join', room, token }); };
+  ws.onopen = () => { opened = true; $('net').classList.add('ok'); send({ t: 'join', room, token }); };
   ws.onmessage = e => { let m; try { m = JSON.parse(e.data); } catch (_) { return; } onMsg(m); };
   ws.onclose = () => {
     $('net').classList.remove('ok');
     if (kicked) return;
+    if (!opened) { mode = 'p2p'; return connect(); } // no relay here: static hosting, go peer-to-peer
     setStatus('Reconnecting…'); setMode('wait');
     retryT = setTimeout(connect, 1000);
   };
+}
+function peerOpts() {
+  const h = params.get('peerhost');
+  if (!h) return { debug: 0 };
+  const [host, port] = h.split(':');
+  return { debug: 0, host, port: +port || 443, secure: location.protocol === 'https:' && host !== 'localhost', path: '/' };
+}
+function p2pRetry(ms) {
+  $('net').classList.remove('ok');
+  if (kicked) return;
+  setStatus('Reconnecting…'); setMode('wait');
+  clearTimeout(retryT); retryT = setTimeout(connect, ms);
+}
+function p2pConnect() {
+  if (!window.Peer) {
+    if (document.readyState !== 'complete') return addEventListener('load', connect, { once: true });
+    return setStatus('Couldn’t load the connection library. Check your internet.');
+  }
+  if (conn) { const c = conn; conn = null; try { c.close(); } catch (e) {} }
+  if (!peer || peer.destroyed) {
+    peer = new Peer(peerOpts());
+    peer.on('error', err => {
+      if (err.type === 'peer-unavailable') { // no game screen with that code
+        clearTimeout(retryT); conn = null;
+        if (joinedRoom === room) { setStatus('Waiting for the game screen…'); setMode('wait'); retryT = setTimeout(connect, 2000); return; } // TV reloading
+        show('join'); $('code').value = room; $('err').textContent = `No game found with code ${room}. Check the TV.`;
+      } else if (!conn || !conn.open) { peer.destroy(); p2pRetry(1500); }
+    });
+    peer.on('disconnected', () => { if (!peer.destroyed && !(conn && conn.open)) { peer.destroy(); p2pRetry(1000); } });
+  }
+  if (!peer.open) return peer.once('open', p2pDial);
+  p2pDial();
+}
+function p2pDial() {
+  // reliable:false = unordered channel: a lost packet never holds up the presses behind it
+  const c = peer.connect(P2P_PREFIX + room, { reliable: false, serialization: 'json' });
+  conn = c; seq = 0; tc = 0; fc = 0; lastSq = 0;
+  const giveUp = setTimeout(() => { if (conn === c && !c.open) { try { c.close(); } catch (e) {} conn = null; p2pRetry(500); } }, 12000);
+  c.on('open', () => {
+    clearTimeout(giveUp);
+    if (conn !== c) return;
+    $('net').classList.add('ok'); joinedRoom = room;
+    send({ t: 'join', room, token });
+    heartbeat();
+  });
+  c.on('data', m => { if (conn === c && m && typeof m === 'object') onMsg(m); });
+  const lost = () => { clearTimeout(giveUp); if (conn !== c) return; conn = null; p2pRetry(1000); };
+  c.on('close', lost);
+  c.on('error', lost);
+  c.on('iceStateChanged', s => { if (s === 'failed' || s === 'closed') lost(); });
 }
 
 function onMsg(m) {
@@ -214,6 +288,7 @@ function onMsg(m) {
     b.onclick = () => { kicked = false; box.innerHTML = ''; box.style.pointerEvents = 'none'; connect(); };
     box.style.pointerEvents = 'auto'; box.append(b);
   } else if (m.t === 'status') {
+    if (m.sq != null) { if (m.sq <= lastSq) return; lastSq = m.sq; } // peer-to-peer can reorder
     show('pad');
     setColor(m.color);
     $('who').textContent = m.name + (m.team ? ' · ' + m.team.replace('TEAM ', '') : '');
@@ -240,11 +315,11 @@ function bind(el, key) {
     const r = el.getBoundingClientRect(), rp = document.createElement('span');
     rp.className = 'ripple'; rp.style.left = (e.clientX - r.left) + 'px'; rp.style.top = (e.clientY - r.top) + 'px';
     el.append(rp); setTimeout(() => rp.remove(), 500);
-    if (!held[key]) { held[key] = true; el.classList.add('on'); send({ t: 'in', ...held }); if (navigator.vibrate) navigator.vibrate(8); }
+    if (!held[key]) { held[key] = true; if (key === 'turn') tc++; else fc++; el.classList.add('on'); sendInput(); heartbeat(); if (navigator.vibrate) navigator.vibrate(8); }
     keepAwake();
   };
   const up = () => {
-    if (held[key]) { held[key] = false; el.classList.remove('on'); send({ t: 'in', ...held }); }
+    if (held[key]) { held[key] = false; el.classList.remove('on'); sendInput(); }
   };
   el.addEventListener('pointerdown', down);
   el.addEventListener('pointerup', up);
@@ -254,7 +329,7 @@ function bind(el, key) {
 bind($('turn'), 'turn');
 bind($('fire'), 'fire');
 document.addEventListener('contextmenu', e => e.preventDefault());
-setInterval(() => send({ t: 'ping' }), 10000); // keeps the connection alive while idle (Funnel/proxies cut quiet ones)
+setInterval(() => { if (mode === 'ws') send({ t: 'ping' }); }, 10000); // keeps the connection alive while idle (Funnel/proxies cut quiet ones)
 // iOS Safari ignores user-scalable=no, so block the zoom gestures directly.
 // Pointer events above still fire; only the browser's own double-tap/pinch handling is cancelled.
 const keepNative = el => !!(el && el.closest && el.closest('input, button'));
@@ -270,7 +345,7 @@ async function keepAwake() {
   try { lock = await navigator.wakeLock.request('screen'); lock.addEventListener('release', () => { lock = null; }); } catch (e) {}
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) { held.turn = held.fire = false; send({ t: 'in', ...held }); for (const b of document.querySelectorAll('.btn')) b.classList.remove('on'); }
+  if (document.hidden) { held.turn = held.fire = false; sendInput(); for (const b of document.querySelectorAll('.btn')) b.classList.remove('on'); }
 });
 
 function start(code) {

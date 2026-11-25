@@ -31,12 +31,13 @@
   <button id="tuneDart">Test: give every ship a Time Dart</button>
 </div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"></script>
 <script>
 'use strict';
 // A phone that opens the main address gets the controller, not a second game screen.
 // (Add ?screen to the address to force the game screen on a small device.)
 if (/^https?:$/.test(location.protocol) && !/[?&]screen/.test(location.search) &&
-    matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 600) location.replace('/pad');
+    matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) < 600) location.replace('pad.html' + location.search);
 // ============================================================
 //  COMET CLASH — local keyboard arena dogfights (2–4 players)
 // ============================================================
@@ -2762,23 +2763,104 @@ document.getElementById('tuneReset').addEventListener('click', e => {
   TUNABLES.forEach((t, i) => t[5](tuneDefaults[i])); saveTune(); buildTunePanel(); e.currentTarget.blur();
 });
 
-// ---------------- phone controllers (needs server.py; the game works fine without it) ----------------
-// The TV page is the "host". Phones open /pad, get a slot, and send TURN/FIRE up/down events,
+// ---------------- phone controllers ----------------
+// The TV page is the "host". Phones open pad.html, get a slot, and send TURN/FIRE up/down events,
 // which land in phoneIn[] and are read by gatherInputs() exactly like keyboard or bot input.
-const net = { ws: null, ok: false, code: '', lan: '', qr: null, bigQR: false, pads: {}, tokens: {}, pushT: 0 };
+// Two transports, same messages:
+//  - server.py (LAN / Tailscale): phones -> WebSocket relay -> this page.
+//  - static hosting (GitHub Pages): phones connect straight to this page over WebRTC (PeerJS).
+//    The PeerJS broker only introduces the two sides; game traffic never goes through it.
+const net = { mode: '', ws: null, peer: null, conns: {}, seen: {}, nextId: 0, ok: false, err: '', code: '', lan: '', qr: null, bigQR: false, pads: {}, tokens: {}, pushT: 0, sq: 0 };
 const phoneIn = PIDS.map(() => ({ turn: false, fire: false, turnP: 0, fireP: 0, id: null, connected: false }));
 const padStatus = PIDS.map(() => null);
-// opened on localhost: use the address the server advertises (LAN or Funnel); otherwise phones use the same address as this page
-const padURL = () => `${/^(localhost|127\.|\[::1\])/.test(location.hostname) ? (net.lan || location.origin) : location.origin}/pad?room=${net.code}`;
-function netSend(o) { if (net.ws && net.ws.readyState === 1) net.ws.send(JSON.stringify(o)); }
+const P2P_PREFIX = 'comet-clash-v1-', CODE_LETTERS = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+const randomCode = () => Array.from({ length: 4 }, () => CODE_LETTERS[Math.floor(Math.random() * CODE_LETTERS.length)]).join('');
+// optional ?peerhost=host:port points PeerJS at your own broker (for testing or self-hosting)
+function peerOpts() {
+  const h = new URLSearchParams(location.search).get('peerhost');
+  if (!h) return { debug: 0 };
+  const [host, port] = h.split(':');
+  return { debug: 0, host, port: +port || 443, secure: location.protocol === 'https:' && host !== 'localhost', path: '/' };
+}
+function padURL() {
+  if (net.mode === 'p2p') {
+    const u = new URL('pad.html', location.href); u.search = `?room=${net.code}&p=1`;
+    const ph = new URLSearchParams(location.search).get('peerhost'); if (ph) u.searchParams.set('peerhost', ph);
+    return u.href;
+  }
+  // opened on localhost: use the address the server advertises (LAN or Funnel); otherwise phones use the same address as this page
+  return `${/^(localhost|127\.|\[::1\])/.test(location.hostname) ? (net.lan || location.origin) : location.origin}/pad?room=${net.code}`;
+}
+function netSend(o) {
+  if (net.mode === 'p2p') {
+    if (o.t !== 'to') return; // pings are a relay thing
+    const c = net.conns[o.id]; if (c && c.open) try { c.send(o.m); } catch (e) {}
+  } else if (net.ws && net.ws.readyState === 1) net.ws.send(JSON.stringify(o));
+}
 function netConnect() {
   if (!/^https?:$/.test(location.protocol)) return; // opened as a file: keyboard-only
-  let ws;
-  try { ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`); } catch (e) { return; }
-  net.ws = ws;
-  ws.onopen = () => { let want = ''; try { want = sessionStorage.getItem('cc.room') || ''; } catch (e) {} ws.send(JSON.stringify({ t: 'host', want })); };
+  if (net.mode === 'p2p' || /\.github\.io$/.test(location.hostname) || /[?&]p2p/.test(location.search)) return p2pHost();
+  let ws, opened = false;
+  try { ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`); } catch (e) { return p2pHost(); }
+  net.ws = ws; net.mode = 'ws';
+  ws.onopen = () => { opened = true; let want = ''; try { want = sessionStorage.getItem('cc.room') || ''; } catch (e) {} ws.send(JSON.stringify({ t: 'host', want })); };
   ws.onmessage = e => { let m; try { m = JSON.parse(e.data); } catch (_) { return; } netMsg(m); };
-  ws.onclose = () => { net.ok = false; net.ws = null; setTimeout(netConnect, 3000); };
+  // never reached a relay: this is static hosting, so go peer-to-peer instead
+  ws.onclose = () => { net.ok = false; net.ws = null; if (!opened && !net.ok) { net.mode = 'p2p'; p2pHost(); } else setTimeout(netConnect, 3000); };
+}
+function whenPeer(fn) {
+  if (window.Peer) return fn();
+  if (document.readyState === 'complete') { net.err = 'Couldn’t load PeerJS. Check your internet'; return; }
+  addEventListener('load', () => whenPeer(fn), { once: true });
+}
+function p2pHost(tries = 0) {
+  net.mode = 'p2p';
+  whenPeer(() => {
+    let want = '';
+    try { want = sessionStorage.getItem('cc.room') || ''; } catch (e) {}
+    if (!/^[A-Z]{4}$/.test(want) || tries >= 3) want = randomCode();
+    const peer = new Peer(P2P_PREFIX + want, peerOpts());
+    net.peer = peer;
+    peer.on('open', () => { net.err = ''; netMsg({ t: 'room', code: want, lan: '' }); });
+    peer.on('connection', p2pAccept);
+    // lost the broker: games in progress keep running peer-to-peer; reconnect so new phones can join
+    peer.on('disconnected', () => { if (!peer.destroyed) setTimeout(() => { if (!peer.destroyed) peer.reconnect(); }, 1000); });
+    peer.on('error', err => {
+      if (err.type === 'peer-unavailable') return;
+      if (err.type === 'unavailable-id') { // our old code is still registered (page reload) or taken
+        peer.destroy(); if (tries >= 2) try { sessionStorage.removeItem('cc.room'); } catch (e) {}
+        return setTimeout(() => p2pHost(tries + 1), tries < 2 ? 1500 : 0);
+      }
+      if (['network', 'server-error', 'socket-error', 'socket-closed'].includes(err.type) && !net.ok) {
+        net.err = 'Can’t reach the matchmaking server. Retrying…';
+        peer.destroy(); setTimeout(() => p2pHost(tries), 3000);
+      }
+    });
+  });
+}
+function p2pAccept(conn) {
+  const id = ++net.nextId;
+  const drop = () => {
+    if (net.conns[id] !== conn) return;
+    delete net.conns[id]; delete net.seen[id];
+    try { conn.close(); } catch (e) {}
+    padLeave(id);
+  };
+  conn.on('data', m => {
+    if (!m || typeof m !== 'object') return;
+    net.seen[id] = performance.now();
+    if (m.t === 'join' && !net.conns[id]) {
+      const token = String(m.token || '').slice(0, 40);
+      // same phone reconnecting before its old connection timed out: retire the old one first
+      for (const oid in net.conns) if (net.pads[oid] && net.pads[oid].token === token && token) { const c = net.conns[oid]; delete net.conns[oid]; delete net.seen[oid]; try { c.close(); } catch (e) {} padLeave(+oid); }
+      net.conns[id] = conn;
+      padJoin({ id, token, name: String(m.name || '').slice(0, 16) });
+    } else if (m.t === 'in' && net.conns[id]) padInput(id, m);
+  });
+  conn.on('close', drop);
+  conn.on('error', drop);
+  conn.on('iceStateChanged', s => { if (s === 'failed' || s === 'closed') drop(); });
+  conn._drop = drop;
 }
 function netMsg(m) {
   if (m.t === 'room') {
@@ -2787,14 +2869,25 @@ function netMsg(m) {
     try { const q = qrcode(0, 'M'); q.addData(padURL()); q.make(); net.qr = q; } catch (e) { net.qr = null; } // QR library offline: show the address only
   } else if (m.t === 'join') padJoin(m);
   else if (m.t === 'leave') padLeave(m.id);
-  else if (m.t === 'in') {
-    const pad = net.pads[m.id]; if (!pad || pad.slot < 0) return;
-    const o = phoneIn[pad.slot]; if (o.id !== m.id) return;
+  else if (m.t === 'in') padInput(m.id, m);
+}
+function padInput(id, m) {
+  const pad = net.pads[id]; if (!pad || pad.slot < 0) return;
+  const o = phoneIn[pad.slot]; if (o.id !== id) return;
+  if (m.s != null) { // peer-to-peer: messages can arrive out of order, so drop stale ones
+    if (m.s <= o.seq) return;
+    o.seq = m.s;
+  }
+  if (m.tc != null) {
+    // press counters, so a tap still counts even if the message carrying it was overtaken
+    o.turnP = Math.min(3, o.turnP + Math.max(0, m.tc - o.tc)); o.tc = Math.max(o.tc, m.tc);
+    o.fireP = Math.min(3, o.fireP + Math.max(0, m.fc - o.fc)); o.fc = Math.max(o.fc, m.fc);
+  } else {
     // queue presses (max 3) so quick taps that land between frames all count
     if (m.turn && !o.turn) o.turnP = Math.min(3, o.turnP + 1);
     if (m.fire && !o.fire) o.fireP = Math.min(3, o.fireP + 1);
-    o.turn = !!m.turn; o.fire = !!m.fire;
   }
+  o.turn = !!m.turn; o.fire = !!m.fire;
 }
 function padJoin(m) {
   let slot = -1;
@@ -2809,7 +2902,7 @@ function padJoin(m) {
   cfg.slots[slot] = 'phone'; syncCfg();
   net.pads[m.id] = { slot, token: m.token, name: m.name };
   if (m.token) net.tokens[m.token] = slot;
-  Object.assign(phoneIn[slot], { turn: false, fire: false, turnP: 0, fireP: 0, id: m.id, connected: true });
+  Object.assign(phoneIn[slot], { turn: false, fire: false, turnP: 0, fireP: 0, seq: 0, tc: 0, fc: 0, id: m.id, connected: true });
   padStatus[slot] = null;
   SFX.pickup(); lobbyNote(`${PDEF[slot].name} joined on a phone`);
 }
@@ -2852,6 +2945,10 @@ function padStateFor(p) {
 function netTick(dt) {
   net.pingT = (net.pingT || 0) - dt;
   if (net.pingT <= 0) { net.pingT = 10; netSend({ t: 'ping' }); } // keeps quiet connections from being cut
+  if (net.mode === 'p2p') { // phones send a heartbeat every second; WebRTC alone can take 30 s to notice a dead phone
+    const now = performance.now();
+    for (const id in net.conns) if (now - (net.seen[id] || now) > 5000) net.conns[id]._drop();
+  }
   net.pushT -= dt;
   if (!net.ok || net.pushT > 0) return;
   net.pushT = 0.1;
@@ -2862,7 +2959,7 @@ function netTick(dt) {
     const prev = padStatus[p] ? JSON.parse(padStatus[p]) : null;
     padStatus[p] = key;
     const buzz = !prev ? '' : prev.mode === 'ship' && st.mode === 'pilot' ? 'hit' : prev.mode !== 'out' && st.mode === 'out' ? 'out' : prev.mode !== 'win' && st.mode === 'win' ? 'win' : '';
-    netSend({ t: 'to', id: phoneIn[p].id, m: { t: 'status', ...st, buzz } });
+    netSend({ t: 'to', id: phoneIn[p].id, m: { t: 'status', ...st, buzz, sq: ++net.sq } });
   }
 }
 function drawQR(q, x, y, size) {
@@ -2879,8 +2976,12 @@ function drawPhoneJoin() {
     ctx.font = `700 11px ${FONT}`; ctx.fillStyle = 'rgba(200,205,255,0.55)';
     ctx.fillText('PHONE CONTROLLERS', x, y + 10);
     ctx.font = `600 10px ${FONT}`;
-    ctx.fillText('run  python3 server.py  and open', x, y + 28);
-    ctx.fillText('the address it prints', x, y + 44);
+    if (net.mode === 'p2p') ctx.fillText(net.err || 'setting up a room…', x, y + 28);
+    else if (/^https?:$/.test(location.protocol)) ctx.fillText('connecting…', x, y + 28);
+    else {
+      ctx.fillText('run  python3 server.py  and open', x, y + 28);
+      ctx.fillText('the address it prints', x, y + 44);
+    }
     return;
   }
   const size = 92;

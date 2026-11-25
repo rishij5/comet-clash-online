@@ -3,7 +3,22 @@
 One-button arena dogfights for 1–8 players. Everyone flies a ship that always moves forward,
 with just two controls: **TURN** and **FIRE**. Play on one keyboard, with bots, or with phones as controllers.
 
-## Run it
+## Play online (GitHub Pages)
+
+The game runs as plain static files, so it can be hosted on GitHub Pages with no server:
+open the page on the TV/laptop, and it makes a room with a 4-letter code and a QR code.
+Phones scan it and connect **straight to the game screen** over WebRTC (via [PeerJS](https://peerjs.com)).
+The free PeerJS broker only introduces the phone and the screen. Button presses go directly between them,
+on an unordered channel so one lost packet never delays the presses behind it.
+
+To turn it on: **Settings → Pages → Deploy from a branch → `main` / root.** The game is then at
+`https://<owner>.github.io/comet-clash/`. (Pages on a private repo needs a paid GitHub plan. Otherwise make the repo public.)
+
+- On strict networks (uni, school, guest Wi-Fi) a direct connection can fail. PeerJS then falls back to its
+  free relay servers, which work but add delay.
+- `?peerhost=host:port` points it at your own PeerJS server instead of the public one.
+
+## Run it locally
 
 You only need Python 3 (already on macOS).
 
@@ -68,6 +83,6 @@ public `https://…ts.net` address, and the lobby QR code points phones there.
 |---|---|
 | `index.html` | The game: lobby, gameplay, bots, rendering |
 | `pad.html` | Phone controller page |
-| `server.py` | Serves the game and relays phone input over WebSockets (standard library only) |
+| `server.py` | Serves the game and relays phone input over WebSockets (standard library only). Not needed on GitHub Pages, where phones connect peer-to-peer |
 | `play-online.sh` | Starts the server and shares it online with Tailscale Funnel |
 | `Comet Clash.command` | Double-click launcher for macOS |
