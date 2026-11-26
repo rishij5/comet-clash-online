@@ -9,7 +9,8 @@
 <style>
   html,body{margin:0;height:100%;background:#06060d;overflow:hidden}
   body{display:flex;align-items:center;justify-content:center}
-  canvas{display:block}
+  canvas{display:block;touch-action:none}
+  body{-webkit-user-select:none;user-select:none;-webkit-tap-highlight-color:transparent}
   #tune{position:fixed;top:12px;right:12px;width:290px;max-height:calc(100vh - 24px);overflow:auto;box-sizing:border-box;
     background:rgba(10,10,26,.95);border:1px solid rgba(120,130,255,.45);border-radius:12px;padding:12px 14px;
     color:#dfe3ff;font:12px system-ui,sans-serif;display:none;z-index:5}
@@ -199,7 +200,11 @@ addEventListener('blur', () => { for (const k in keys) keys[k] = false; autoPaus
 document.addEventListener('visibilitychange', () => { if (document.hidden) autoPause(); });
 // mouse: lobby options, key caps, pause buttons (rects are rebuilt every frame by render)
 let clickRects = [];
+// tablets and touch laptops: show tap prompts instead of key hints (switches on with the first touch)
+let touchUI = matchMedia('(pointer: coarse)').matches;
 cv.addEventListener('pointerdown', e => {
+  if (e.pointerType === 'touch') touchUI = true;
+  else if (e.pointerType === 'mouse') touchUI = false;
   initAudio();
   const r = cv.getBoundingClientRect();
   const x = (e.clientX - r.left) / r.width * W, y = (e.clientY - r.top) / r.height * H;
@@ -2388,7 +2393,14 @@ function drawHUD() {
   }
   ctx.font = `600 12px ${FONT}`; ctx.fillStyle = 'rgba(180,190,255,0.6)'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
   ctx.fillText(`ROUND ${roundNum} · ${mapName}${curWrap ? '  ⇄ WRAP' : ''}`, 16, 20);
-  ctx.textAlign = 'right'; ctx.fillText('ESC: PAUSE', W - 16, 20);
+  if (touchUI) {
+    ctx.fillStyle = 'rgba(29,31,61,0.85)'; ctx.strokeStyle = 'rgba(120,130,255,0.5)'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.roundRect(W - 112, 6, 100, 30, 8); ctx.fill(); ctx.stroke();
+    ctx.font = `700 13px ${FONT}`; ctx.fillStyle = '#ffffff'; ctx.textAlign = 'center'; ctx.fillText('❚❚ PAUSE', W - 62, 22);
+    ctx.font = `600 12px ${FONT}`;
+  } else { ctx.textAlign = 'right'; ctx.fillText('ESC: PAUSE', W - 16, 20); }
+  if (state === 'play' || state === 'roundEnd') // generous hit area, easy to hit with a thumb
+    clickRects.push({ x: W - 150, y: 0, w: 150, h: 48, fn: () => { pausedFrom = state; state = 'pause'; SFX.beep(); } });
   if (countdown > 0) {
     const n = Math.ceil(countdown / 0.6), k = (countdown % 0.6) / 0.6;
     ctx.textAlign = 'center'; ctx.font = `800 ${90 + k * 40}px ${FONT}`;
@@ -2492,8 +2504,8 @@ function drawPause() {
   panel(W / 2 - 230, H / 2 - 130, 460, 260);
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.font = `800 40px ${FONT}`; ctx.fillStyle = '#ffffff'; ctx.fillText('PAUSED', W / 2, H / 2 - 72);
-  button(W / 2 - 170, H / 2 - 22, 340, 50, 'RESUME  ·  ESC / SPACE', () => { state = pausedFrom; SFX.beep(); });
-  button(W / 2 - 170, H / 2 + 44, 340, 50, 'QUIT TO LOBBY  ·  ENTER', () => { state = 'lobby'; SFX.beep(); });
+  button(W / 2 - 170, H / 2 - 22, 340, 50, touchUI ? 'RESUME' : 'RESUME  ·  ESC / SPACE', () => { state = pausedFrom; SFX.beep(); });
+  button(W / 2 - 170, H / 2 + 44, 340, 50, touchUI ? 'QUIT TO LOBBY' : 'QUIT TO LOBBY  ·  ENTER', () => { state = 'lobby'; SFX.beep(); });
 }
 
 // lobby widgets
@@ -2646,10 +2658,10 @@ function drawLobby() {
     ctx.font = `600 10px ${FONT}`; ctx.textAlign = 'center';
     ctx.fillStyle = on ? '#ffffff' : (Math.sin(time * 4) > 0 ? 'rgba(255,255,255,0.8)' : 'rgba(255,255,255,0.35)');
     ctx.fillText(mode === 'human' ? 'READY' : mode === 'bot' ? `BOT · ${BOT[cfg.botLevel].name}` : mode === 'phone' ? (phoneIn[i].connected ? 'PHONE READY' : 'PHONE OFFLINE')
-      : pd.turn ? `PRESS ${pd.keys[0]} TO JOIN` : 'PHONE OR BOT', cx0, y0 + sh + 14);
+      : pd.turn && !touchUI ? `PRESS ${pd.keys[0]} TO JOIN` : 'PHONE OR BOT', cx0, y0 + sh + 14);
   });
   ctx.font = `600 11px ${FONT}`; ctx.textAlign = 'center'; ctx.fillStyle = 'rgba(200,205,255,0.55)';
-  ctx.fillText('KEY TEST: caps light up while held. Everyone hold both keys at once; if a cap stays dark, your keyboard can’t register that combo. Click a cap to rebind.', W / 2, 346);
+  if (!touchUI) ctx.fillText('KEY TEST: caps light up while held. Everyone hold both keys at once; if a cap stays dark, your keyboard can’t register that combo. Click a cap to rebind.', W / 2, 346);
 
   // match options
   const px = W / 2 - 560, py = 386;
@@ -2666,10 +2678,10 @@ function drawLobby() {
   const mapNames = ['RANDOM', ...MAPS.map(m => m.name), 'GENERATED'];
   const cyc = d => () => { cfg.map = (cfg.map + d + mapNames.length) % mapNames.length; syncCfg(); SFX.beep(); };
   chipRow('MAP', R, y, [{ label: '◀', w: 32, fn: cyc(-1) }, { label: mapNames[cfg.map] || 'RANDOM', on: true, w: 150, color: '#8d83d6', fn: () => { mapPicker = true; SFX.beep(); } }, { label: '▶', w: 32, fn: cyc(1) }]);
-  ctx.font = `600 10px ${FONT}`; ctx.textAlign = 'left'; ctx.fillStyle = 'rgba(200,205,255,0.5)'; ctx.fillText('CLICK NAME TO BROWSE', R + 384, y + 13);
+  ctx.font = `600 10px ${FONT}`; ctx.textAlign = 'left'; ctx.fillStyle = 'rgba(200,205,255,0.5)'; ctx.fillText(touchUI ? 'TAP NAME TO BROWSE' : 'CLICK NAME TO BROWSE', R + 384, y + 13);
   chipRow('POWER-UPS', R, y += 36, POW_TYPES.map(t => ({ icon: t, on: cfg.pows[t], color: POW[t].color, w: 40, fn: () => { cfg.pows[t] = !cfg.pows[t]; syncCfg(); SFX.beep(); } })));
   ctx.font = `600 11px ${FONT}`; ctx.textAlign = 'left'; ctx.fillStyle = 'rgba(200,205,255,0.5)';
-  ctx.fillText(`click to toggle · ${POW_TYPES.filter(t => cfg.pows[t]).length} of ${POW_TYPES.length} on`, R + 150, y + 38);
+  ctx.fillText(`${touchUI ? 'tap' : 'click'} to toggle · ${POW_TYPES.filter(t => cfg.pows[t]).length} of ${POW_TYPES.length} on`, R + 150, y + 38);
   ctx.font = `600 12px ${FONT}`; ctx.fillStyle = 'rgba(220,225,255,0.75)';
   ['HOLD TURN to rotate · TAP FIRE to shoot (3 shots, auto-reload)', 'DOUBLE-TAP TURN to snap-turn · shoot colored asteroids for power-ups',
    'Lose your ship? Your pilot ejects. Survive 5s to respawn.', 'Last ship (or team) flying wins the round.']
@@ -2680,12 +2692,23 @@ function drawLobby() {
   let msg, col = '#ffffff';
   if (rebind) { msg = `PRESS A NEW ${rebind.which ? 'FIRE' : 'TURN'} KEY FOR ${PDEF[rebind.p].name}  ·  ESC TO CANCEL`; col = PDEF[rebind.p].color; }
   else if (lobbyMsgT > 0) { msg = lobbyMsg.toUpperCase(); col = '#ffc93d'; }
+  else if (touchUI) msg = n >= 2 ? 'TAP TO LAUNCH' : n === 1 ? 'TAP FOR SOLO PRACTICE · OR ADD A PHONE OR BOT' : 'JOIN ON A PHONE · OR TAP ADD BOT ON A SLOT';
   else msg = n >= 2 ? 'PRESS SPACE TO LAUNCH' : n === 1 ? 'PRESS SPACE FOR SOLO PRACTICE · OR ADD A PLAYER OR BOT' : 'JOIN WITH YOUR TURN KEY · OR CLICK A SLOT TO ADD A BOT';
-  ctx.textAlign = 'center'; ctx.font = `800 21px ${FONT}`; ctx.fillStyle = col;
+  ctx.textAlign = 'center'; ctx.font = `800 21px ${FONT}`;
+  if (!rebind) { // the prompt is also a launch button (tap or click)
+    const bw = Math.min(W - 80, ctx.measureText(msg).width + 56), bx = W / 2 - bw / 2, by = 634;
+    if (touchUI && n > 0 && lobbyMsgT <= 0) {
+      ctx.fillStyle = 'rgba(70,179,255,0.16)'; ctx.strokeStyle = 'rgba(70,179,255,0.7)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.roundRect(bx, by, bw, 44, 12); ctx.fill(); ctx.stroke();
+    }
+    clickRects.push({ x: bx, y: by, w: bw, h: 44, fn: () => { if (!net.bigQR && !mapPicker) tryStart(); } });
+  }
+  ctx.fillStyle = col;
   ctx.globalAlpha = rebind || lobbyMsgT > 0 || Math.sin(time * 5) > -0.3 ? 1 : 0.5;
   ctx.fillText(msg, W / 2, 656); ctx.globalAlpha = 1;
   ctx.font = `600 12px ${FONT}`; ctx.fillStyle = 'rgba(200,205,255,0.55)';
-  ctx.fillText('3 · 5 · 7 · 9  ROUNDS   ·   TAB  SINGLE / TRIPLE   ·   `  TUNING PANEL   ·   ESC IN GAME  PAUSE', W / 2, 690);
+  ctx.fillText(touchUI ? 'TAP ANY OPTION TO CHANGE IT   ·   TAP ❚❚ IN GAME TO PAUSE'
+    : '3 · 5 · 7 · 9  ROUNDS   ·   TAB  SINGLE / TRIPLE   ·   `  TUNING PANEL   ·   ESC IN GAME  PAUSE', W / 2, 690);
   if (net.bigQR) drawBigQR();
   if (mapPicker) drawMapPicker();
 }
@@ -2715,8 +2738,9 @@ function render() {
     ctx.fillStyle = 'rgba(120,130,255,0.2)'; ctx.fillRect(W / 2 - bw / 2, by, bw, 4);
     ctx.fillStyle = col; ctx.fillRect(W / 2 - bw / 2, by, bw * k, 4);
   } else if (state === 'matchEnd') {
-    drawStats(`BACK TO LOBBY IN ${Math.max(1, Math.ceil(matchEndT))}…  ·  SPACE TO SKIP`);
+    drawStats(`BACK TO LOBBY IN ${Math.max(1, Math.ceil(matchEndT))}…  ·  ${touchUI ? 'TAP' : 'SPACE'} TO SKIP`);
     drawWorldParticlesOnly();
+    clickRects.push({ x: 0, y: 0, w: W, h: H, fn: () => { state = 'lobby'; SFX.beep(); } });
   }
   if (state === 'pause') drawPause();
 }
